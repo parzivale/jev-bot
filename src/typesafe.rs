@@ -136,8 +136,9 @@ pub struct Client {
 impl Client {
     /// Reads `TYPESAFE_API_KEY`, and `TYPESAFE_MODEL` / `TYPESAFE_BASE_URL` if set.
     pub fn from_env() -> Result<Self, String> {
-        let api_key = crate::env_opt("TYPESAFE_API_KEY")
-            .ok_or_else(|| "TYPESAFE_API_KEY must be set (see .env.example).".to_string())?;
+        let api_key = crate::secret("TYPESAFE_API_KEY")?.ok_or_else(|| {
+            "TYPESAFE_API_KEY or TYPESAFE_API_KEY_FILE must be set (see .env.example).".to_string()
+        })?;
 
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)

@@ -77,7 +77,7 @@ Commands register themselves on connect — there is no separate deploy step.
 ## Test
 
 ```sh
-cargo test                        # 19 tests, no network
+cargo test                        # 25 tests, no network
 cargo test -- --ignored --nocapture   # 3 live tests, needs a real API key
 ```
 
@@ -86,6 +86,57 @@ what was sent, covering the request shape, the response shape, auth header and
 path, status→error mapping, malformed responses, and that 429/529 retry with
 backoff while 422 does not.
 
+## Nix
+
+The flake exposes a package, an app, an overlay and a NixOS module.
+
+```sh
+nix build .#jev-bot     # -> ./result/bin/jev-bot
+nix run .#jev-bot       # build and run
+nix develop             # dev shell: cargo, clippy, rust-analyzer
+```
+
+### Secrets
+
+Every secret can come from a file instead of the environment: set
+`DISCORD_TOKEN_FILE` / `TYPESAFE_API_KEY_FILE` to a path holding just that
+value. The `_FILE` form wins over the inline one, and a trailing newline is
+stripped. Nothing is baked in at build time — a secret passed to a derivation
+would land in the world-readable Nix store.
+
+### NixOS module
+
+```nix
+{
+  inputs.jev-bot.url = "github:parzivale/jev-bot";
+
+  outputs = { nixpkgs, jev-bot, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        jev-bot.nixosModules.default
+        {
+          services.jev-bot = {
+            enable = true;
+            tokenFile = "/run/secrets/jev-bot-discord-token";
+            apiKeyFile = "/run/secrets/jev-bot-typesafe-key";
+            guildId = "123456789012345678";   # optional
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The two `*File` options are read through systemd `LoadCredential`, so the
+values live only in the unit's private credentials directory — never in the
+store, never in the unit's environment, and not readable by other services.
+Any secret manager that drops a file works: sops-nix, agenix, or a plain
+root-owned file.
+
+The unit runs under `DynamicUser` with a restrictive sandbox, and only needs
+outbound network access.
+
 ## Layout
 
 | | |
@@ -93,6 +144,8 @@ backoff while 422 does not.
 | `src/main.rs` | Framework setup, both commands |
 | `src/typesafe.rs` | System One client, wire types, retries, errors |
 | `src/format.rs` | Verdict labels, bar, colour, quoting, embed |
+| `package.nix` | The derivation, also usable via the overlay |
+| `module.nix` | NixOS module: options and the hardened systemd unit |
 
 ## Notes
 

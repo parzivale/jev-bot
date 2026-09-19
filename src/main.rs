@@ -12,6 +12,38 @@ pub(crate) fn env_opt(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Resolve a secret from an inline value or a file path.
+///
+/// Split out from [`secret`] so it can be tested without mutating the process
+/// environment, which races across parallel tests.
+fn read_secret(
+    name: &str,
+    inline: Option<String>,
+    path: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(path) = path else {
+        return Ok(inline);
+    };
+
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {name}_FILE at {path}: {e}"))?;
+
+    // Trailing newlines are near-universal in secret files; a literal one in a
+    // bearer token produces a baffling 401.
+    match contents.trim() {
+        "" => Err(format!("{name}_FILE at {path} is empty")),
+        value => Ok(Some(value.to_string())),
+    }
+}
+
+/// A secret from `<NAME>_FILE` if that is set, otherwise from `<NAME>`.
+///
+/// The file form keeps secrets out of the process environment, and out of the
+/// Nix store: a value supplied at build time would be world-readable there.
+pub(crate) fn secret(name: &str) -> Result<Option<String>, String> {
+    read_secret(name, env_opt(name), env_opt(&format!("{name}_FILE")))
+}
+
 struct Data {
     typesafe: typesafe::Client,
 }
@@ -127,8 +159,9 @@ async fn run() -> Result<(), String> {
     // Absent .env is fine — the vars may come from the environment directly.
     let _ = dotenvy::dotenv();
 
-    let token = env_opt("DISCORD_TOKEN")
-        .ok_or_else(|| "DISCORD_TOKEN must be set (see .env.example).".to_string())?;
+    let token = secret("DISCORD_TOKEN")?.ok_or_else(|| {
+        "DISCORD_TOKEN or DISCORD_TOKEN_FILE must be set (see .env.example).".to_string()
+    })?;
     let typesafe = typesafe::Client::from_env()?;
 
     // Guild-scoped registration shows up immediately; global takes up to an hour.
@@ -183,4 +216,63 @@ async fn run() -> Result<(), String> {
         .start()
         .await
         .map_err(|e| format!("bot stopped: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch path per test; no two tests share a file.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("jev-bot-{}-{tag}", std::process::id()))
+    }
+
+    fn write(tag: &str, contents: &str) -> String {
+        let path = scratch(tag);
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn falls_back_to_the_inline_value() {
+        let got = read_secret("TOK", Some("inline".into()), None).unwrap();
+        assert_eq!(got, Some("inline".into()));
+    }
+
+    #[test]
+    fn absent_everywhere_is_none() {
+        assert_eq!(read_secret("TOK", None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_file_path_wins_over_the_inline_value() {
+        let path = write("wins", "from-file");
+        let got = read_secret("TOK", Some("inline".into()), Some(path)).unwrap();
+        assert_eq!(got, Some("from-file".into()));
+    }
+
+    /// Secret files almost always end in a newline; one inside a bearer token
+    /// produces a 401 that is very hard to read.
+    #[test]
+    fn trailing_whitespace_is_stripped() {
+        let path = write("trailing", "  secret-value\n\n");
+        let got = read_secret("TOK", None, Some(path)).unwrap();
+        assert_eq!(got, Some("secret-value".into()));
+    }
+
+    #[test]
+    fn an_empty_file_is_an_error() {
+        let path = write("empty", "   \n");
+        let err = read_secret("TOK", None, Some(path.clone())).unwrap_err();
+        assert!(err.contains("TOK_FILE"), "got {err}");
+        assert!(err.contains(&path), "error should name the path, got {err}");
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_naming_the_path() {
+        let missing = scratch("nope").to_string_lossy().into_owned();
+        let err = read_secret("TOK", Some("inline".into()), Some(missing.clone())).unwrap_err();
+        assert!(err.contains(&missing), "got {err}");
+        assert!(err.contains("TOK_FILE"), "got {err}");
+    }
 }
